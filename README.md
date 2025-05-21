@@ -204,6 +204,42 @@ python3 webui.py --port 50000 --model_dir pretrained_models/CosyVoice-300M
 
 For advanced user, we have provided train and inference scripts in `examples/libritts/cosyvoice/run.sh`.
 
+### Offline Speech Token Extraction
+
+For users needing to extract speech tokens from audio datasets offline (e.g., for training or analysis), the `tools/extract_speech_token.py` script has been significantly updated for performance. It now utilizes the `s3tokenizer` library, which is a PyTorch-based implementation of the speech tokenizer that allows for efficient batch processing, especially on GPUs.
+
+**Key improvements:**
+*   **Faster Processing:** Leverages batching to significantly speed up token extraction compared to older methods.
+*   **GPU/CPU Support:** Allows specifying the device (`cuda` or `cpu`) for tokenization.
+
+**Prerequisites:**
+Ensure you have installed the latest dependencies, including `s3tokenizer`:
+```sh
+pip install -r requirements.txt
+```
+
+**Usage:**
+
+The script processes audio files listed in a `wav.scp` file located in the specified directory.
+
+```sh
+python tools/extract_speech_token.py \
+    --dir /path/to/your/data_directory_with_wav_scp \
+    --onnx_path /path/to/your/pretrained_models/CosyVoice-300M/speech_tokenizer_v1.onnx \
+    --device "cuda" \
+    --batch_size 32 \
+    --num_thread 4 
+```
+
+**Command-line arguments:**
+*   `--dir`: (Required) Directory containing the `wav.scp` file. The output `utt2speech_token.pt` will also be saved here.
+*   `--onnx_path`: (Required) Path to an ONNX speech tokenizer model file (e.g., `speech_tokenizer_v1.onnx`, `speech_tokenizer_v1_25hz.onnx`, `speech_tokenizer_v2_25hz.onnx`). This path is used to infer the type of S3Tokenizer model to load (the script does not directly load this ONNX file for tokenization anymore but uses it to determine the model architecture for `s3tokenizer`).
+*   `--device`: Device to use for tokenization. Choices: "cuda", "cpu". Defaults to "cuda" if available, otherwise "cpu".
+*   `--batch_size`: Number of audio files to process in a single batch. Default: 32.
+*   `--num_thread`: Number of threads for parallel audio loading and preprocessing. Default: 8.
+
+The script will output a `utt2speech_token.pt` file in the `--dir`, containing a dictionary mapping utterance IDs to their extracted speech tokens.
+
 **Build for deployment**
 
 Optionally, if you want service deployment,
