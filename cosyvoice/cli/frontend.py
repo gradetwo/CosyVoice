@@ -14,6 +14,7 @@
 from functools import partial
 from typing import Generator
 import json
+import platform # Added import
 import onnxruntime
 import torch
 import numpy as np
@@ -51,10 +52,29 @@ class CosyVoiceFrontEnd:
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
-        self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
+
+        onnx_providers = None
+        if platform.system() == 'Darwin':
+            onnx_providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+            logging.info("Using CoreML Execution Provider for ONNX Runtime on macOS.")
+        else:
+            # Default providers, CUDA EP will be used if available for speech_tokenizer_session
+            onnx_providers = ["CPUExecutionProvider"]
+
+
+        self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=onnx_providers)
+        
+        # For speech_tokenizer_session, prioritize CUDA if available and not on Darwin
+        speech_tokenizer_providers = None
+        if platform.system() == 'Darwin':
+            speech_tokenizer_providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+        elif torch.cuda.is_available():
+            speech_tokenizer_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            speech_tokenizer_providers = ["CPUExecutionProvider"]
+            
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+                                                                     providers=speech_tokenizer_providers)
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
         else:
