@@ -14,41 +14,12 @@
 # limitations under the License.
 """Label smoothing module."""
 
-import torch
-from torch import nn
+import mlx.core as mx
+import mlx.nn as nn
 
 
 class LabelSmoothingLoss(nn.Module):
     """Label-smoothing loss.
-
-    In a standard CE loss, the label's data distribution is:
-    [0,1,2] ->
-    [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ]
-
-    In the smoothing version CE Loss,some probabilities
-    are taken from the true label prob (1.0) and are divided
-    among other labels.
-
-    e.g.
-    smoothing=0.1
-    [0,1,2] ->
-    [
-        [0.9, 0.05, 0.05],
-        [0.05, 0.9, 0.05],
-        [0.05, 0.05, 0.9],
-    ]
-
-    Args:
-        size (int): the number of class
-        padding_idx (int): padding class id which will be ignored for loss
-        smoothing (float): smoothing rate (0.0 means the conventional CE)
-        normalize_length (bool):
-            normalize loss by sequence length if True
-            normalize loss by batch size if False
     """
 
     def __init__(self,
@@ -58,39 +29,89 @@ class LabelSmoothingLoss(nn.Module):
                  normalize_length: bool = False):
         """Construct an LabelSmoothingLoss object."""
         super(LabelSmoothingLoss, self).__init__()
-        self.criterion = nn.KLDivLoss(reduction="none")
+        # self.criterion = nn.KLDivLoss(reduction="none") # MLX doesn't have KLDivLoss module?
+        # But we can compute it manually.
+        # KL(P || Q) = sum(P(x) * log(P(x) / Q(x))) = sum(P(x) * (log P(x) - log Q(x)))
+        # Here x is log_softmax output (log_probs). true_dist is P.
+        # criterion(log_probs, target_probs) expects input, target.
+        # PyTorch KLDivLoss: l(x, y) = y * (log y - x)
+
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
         self.size = size
         self.normalize_length = normalize_length
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array, target: mx.array) -> mx.array:
         """Compute loss between x and target.
 
-        The model outputs and data labels tensors are flatten to
-        (batch*seqlen, class) shape and a mask is applied to the
-        padding part which should not be calculated for loss.
-
         Args:
-            x (torch.Tensor): prediction (batch, seqlen, class)
-            target (torch.Tensor):
+            x (mx.array): prediction (batch, seqlen, class)
+            target (mx.array):
                 target signal masked with self.padding_id (batch, seqlen)
         Returns:
-            loss (torch.Tensor) : The KL loss, scalar float value
+            loss (mx.array) : The KL loss, scalar float value
         """
-        assert x.size(2) == self.size
-        batch_size = x.size(0)
-        x = x.view(-1, self.size)
-        target = target.view(-1)
-        # use zeros_like instead of torch.no_grad() for true_dist,
-        # since no_grad() can not be exported by JIT
-        true_dist = torch.zeros_like(x)
-        true_dist.fill_(self.smoothing / (self.size - 1))
-        ignore = target == self.padding_idx  # (B,)
-        total = len(target) - ignore.sum().item()
-        target = target.masked_fill(ignore, 0)  # avoid -1 index
-        true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
-        kl = self.criterion(torch.log_softmax(x, dim=1), true_dist)
-        denom = total if self.normalize_length else batch_size
-        return kl.masked_fill(ignore.unsqueeze(1), 0).sum() / denom
+        assert x.shape[2] == self.size
+        batch_size = x.shape[0]
+        x = x.reshape(-1, self.size)
+        target = target.reshape(-1)
+
+        # true_dist construction
+        # true_dist = mx.zeros_like(x) # MLX doesn't have zeros_like? mx.zeros(x.shape, dtype=x.dtype)
+        # true_dist.fill_(...) -> MLX arrays are immutable.
+
+        # true_dist = mx.full(x.shape, self.smoothing / (self.size - 1), dtype=x.dtype)
+
+        # ignore = target == self.padding_idx
+        # total = len(target) - ignore.sum().item()
+
+        # target = target.masked_fill(ignore, 0) -> target = mx.where(ignore, 0, target)
+
+        # true_dist.scatter_(...) ->
+        # true_dist[mx.arange(len(target)), target] = self.confidence
+
+        # Let's do it efficiently.
+        # We want to compute KL divergence.
+        # Loss = -sum(true_dist * log_probs)
+        # true_dist has value `confidence` at target index, and `smoothing/(size-1)` elsewhere.
+
+        # log_probs = log_softmax(x)
+        log_probs = nn.log_softmax(x, axis=1)
+
+        # Loss = - [ confidence * log_probs[target] + sum_{i!=target} (smoothing/(size-1)) * log_probs[i] ]
+        #      = - [ confidence * log_probs[target] + (smoothing/(size-1)) * (sum(log_probs) - log_probs[target]) ]
+
+        # We need to handle padding_idx.
+
+        ignore = (target == self.padding_idx)
+        # total = (1 - ignore).sum() # count valid
+
+        # Mask target for safe indexing
+        safe_target = mx.where(ignore, 0, target)
+
+        # log_probs_target = log_probs[mx.arange(len(target)), safe_target]
+        # In MLX, gathering like this needs explicit indices or take_along_axis?
+        # log_probs is (N, C). safe_target is (N,).
+
+        # use pick/take logic
+        # row_indices = mx.arange(len(target))
+        # log_probs_target = log_probs[row_indices, safe_target]
+        log_probs_target = mx.take_along_axis(log_probs, safe_target[:, None], axis=1).squeeze(1)
+
+        log_probs_sum = mx.sum(log_probs, axis=1)
+
+        loss_per_sample = - (self.confidence * log_probs_target +
+                             (self.smoothing / (self.size - 1)) * (log_probs_sum - log_probs_target))
+
+        # Mask out ignored
+        loss_per_sample = mx.where(ignore, 0.0, loss_per_sample)
+
+        total_loss = mx.sum(loss_per_sample)
+
+        if self.normalize_length:
+            denom = mx.sum(1 - ignore) # total valid tokens
+        else:
+            denom = batch_size
+
+        return total_loss / denom

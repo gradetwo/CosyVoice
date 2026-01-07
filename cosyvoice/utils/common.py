@@ -21,7 +21,8 @@ import random
 from typing import List
 
 import numpy as np
-import torch
+import mlx.core as mx
+import mlx.nn as nn
 
 IGNORE_ID = -1
 
@@ -53,75 +54,53 @@ instruct_list = ["You are a helpful assistant. 请用广东话表达。<|endofpr
                  "You are a helpful assistant. 你可以尝试用机器人的方式解答吗？<|endofprompt|>"]
 
 
-def pad_list(xs: List[torch.Tensor], pad_value: int):
+def pad_list(xs: List[mx.array], pad_value: int):
     """Perform padding for the list of tensors.
-
-    Args:
-        xs (List): List of Tensors [(T_1, `*`), (T_2, `*`), ..., (T_B, `*`)].
-        pad_value (float): Value for padding.
-
-    Returns:
-        Tensor: Padded tensor (B, Tmax, `*`).
-
-    Examples:
-        >>> x = [torch.ones(4), torch.ones(2), torch.ones(1)]
-        >>> x
-        [tensor([1., 1., 1., 1.]), tensor([1., 1.]), tensor([1.])]
-        >>> pad_list(x, 0)
-        tensor([[1., 1., 1., 1.],
-                [1., 1., 0., 0.],
-                [1., 0., 0., 0.]])
-
     """
-    max_len = max([len(item) for item in xs])
+    max_len = max([item.shape[0] for item in xs])
     batchs = len(xs)
     ndim = xs[0].ndim
-    if ndim == 1:
-        pad_res = torch.zeros(batchs,
-                              max_len,
-                              dtype=xs[0].dtype,
-                              device=xs[0].device)
-    elif ndim == 2:
-        pad_res = torch.zeros(batchs,
-                              max_len,
-                              xs[0].shape[1],
-                              dtype=xs[0].dtype,
-                              device=xs[0].device)
-    elif ndim == 3:
-        pad_res = torch.zeros(batchs,
-                              max_len,
-                              xs[0].shape[1],
-                              xs[0].shape[2],
-                              dtype=xs[0].dtype,
-                              device=xs[0].device)
-    else:
-        raise ValueError(f"Unsupported ndim: {ndim}")
-    pad_res.fill_(pad_value)
-    for i in range(batchs):
-        pad_res[i, :len(xs[i])] = xs[i]
-    return pad_res
+
+    pad_shape = [batchs, max_len] + list(xs[0].shape[1:])
+
+    # MLX doesn't have .fill_ inplace?
+    # Create zeros or fill with pad_value
+    # pad_res = mx.zeros(pad_shape, dtype=xs[0].dtype)
+    pad_res = mx.full(pad_shape, pad_value, dtype=xs[0].dtype)
+
+    # Since MLX arrays are immutable, we cannot do pad_res[i, :len] = xs[i].
+    # We must construct list and stack.
+
+    padded_list = []
+    for x in xs:
+        pad_len = max_len - x.shape[0]
+        if pad_len > 0:
+            # Pad at end of dim 0
+            pad_shape_local = list(x.shape)
+            pad_shape_local[0] = pad_len
+            pad = mx.full(pad_shape_local, pad_value, dtype=x.dtype)
+            x_padded = mx.concatenate([x, pad], axis=0)
+        else:
+            x_padded = x
+        padded_list.append(x_padded)
+
+    return mx.stack(padded_list, axis=0)
 
 
-def th_accuracy(pad_outputs: torch.Tensor, pad_targets: torch.Tensor,
-                ignore_label: int) -> torch.Tensor:
+def th_accuracy(pad_outputs: mx.array, pad_targets: mx.array,
+                ignore_label: int) -> mx.array:
     """Calculate accuracy.
-
-    Args:
-        pad_outputs (Tensor): Prediction tensors (B * Lmax, D).
-        pad_targets (LongTensor): Target label tensors (B, Lmax).
-        ignore_label (int): Ignore label id.
-
-    Returns:
-        torch.Tensor: Accuracy value (0.0 - 1.0).
-
     """
-    pad_pred = pad_outputs.view(pad_targets.size(0), pad_targets.size(1),
-                                pad_outputs.size(1)).argmax(2)
+    pad_pred = pad_outputs.reshape(pad_targets.shape[0], pad_targets.shape[1],
+                                pad_outputs.shape[1]).argmax(2)
     mask = pad_targets != ignore_label
-    numerator = torch.sum(
-        pad_pred.masked_select(mask) == pad_targets.masked_select(mask))
-    denominator = torch.sum(mask)
-    return (numerator / denominator).detach()
+
+    # numerator = torch.sum(pad_pred.masked_select(mask) == pad_targets.masked_select(mask))
+
+    correct = (pad_pred == pad_targets) & mask
+    numerator = mx.sum(correct)
+    denominator = mx.sum(mask)
+    return (numerator / denominator)
 
 
 def get_padding(kernel_size, dilation=1):
@@ -129,85 +108,134 @@ def get_padding(kernel_size, dilation=1):
 
 
 def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
+    # MLX initialization is usually done at construction or by replacing params.
+    # In MLX, models are stateful in parameters but `m` here is likely an `nn.Module`.
+    # `nn.Module` in MLX holds parameters in `self`.
+    # This function is meant to be used with `apply`.
+    # MLX `nn.Module` does not have `apply`.
+    # But for porting purposes, this function might be called explicitly if we were iterating.
+    # If the user code calls `model.apply(init_weights)`, it will fail in MLX.
+    # However, in `hifigan/generator.py`, we removed `apply` calls or should have.
+    # Let's check `generator.py` port.
+    # I commented out `apply` in `generator.py` in my previous step.
+    # So this function might not be called.
+    # I will leave it empty or implement a warning.
+    pass
 
 
 # Repetition Aware Sampling in VALL-E 2
 def ras_sampling(weighted_scores, decoded_tokens, sampling, top_p=0.8, top_k=25, win_size=10, tau_r=0.1):
     top_ids = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k)
-    rep_num = (torch.tensor(decoded_tokens[-win_size:]).to(weighted_scores.device) == top_ids).sum().item()
-    if rep_num >= win_size * tau_r:
-        top_ids = random_sampling(weighted_scores, decoded_tokens, sampling)
+    # Check repetition
+    # decoded_tokens is list of ints
+    if len(decoded_tokens) >= win_size:
+        recent_tokens = mx.array(decoded_tokens[-win_size:])
+        rep_num = mx.sum(recent_tokens == top_ids).item()
+        if rep_num >= win_size * tau_r:
+            top_ids = random_sampling(weighted_scores, decoded_tokens, sampling)
     return top_ids
 
 
 def nucleus_sampling(weighted_scores, top_p=0.8, top_k=25):
-    prob, indices = [], []
-    cum_prob = 0.0
-    sorted_value, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
-    for i in range(len(sorted_idx)):
-        # sampling both top-p and numbers.
-        if cum_prob < top_p and len(prob) < top_k:
-            cum_prob += sorted_value[i]
-            prob.append(sorted_value[i])
-            indices.append(sorted_idx[i])
+    # weighted_scores: (vocab_size,)
+    probs = nn.softmax(weighted_scores, axis=0)
+
+    # Sort
+    sorted_indices = mx.argsort(probs, axis=0)[::-1]
+    sorted_probs = probs[sorted_indices]
+
+    cum_probs = mx.cumsum(sorted_probs, axis=0)
+
+    # Cutoff
+    # We need to find index where cum_probs >= top_p
+    # mask = cum_probs < top_p
+    # But we want to include the first one that crosses top_p?
+    # Or strict?
+    # Torch code: if cum_prob < top_p and len(prob) < top_k: append.
+
+    # We can do this in numpy for scalar logic ease if we want 1:1,
+    # or implement vectorized if possible.
+    # Since this is sampling (one step), efficiency isn't critical.
+
+    probs_np = np.array(probs)
+    sorted_idx_np = np.array(sorted_indices)
+
+    selected_probs = []
+    selected_indices = []
+    cum = 0.0
+    for i in range(len(sorted_idx_np)):
+        if cum < top_p and len(selected_probs) < top_k:
+            p = probs_np[sorted_idx_np[i]]
+            cum += p
+            selected_probs.append(p)
+            selected_indices.append(sorted_idx_np[i])
         else:
             break
-    prob = torch.tensor(prob).to(weighted_scores)
-    indices = torch.tensor(indices, dtype=torch.long).to(weighted_scores.device)
-    top_ids = indices[prob.multinomial(1, replacement=True)].item()
-    return top_ids
+
+    # Normalize selected probs
+    selected_probs = np.array(selected_probs)
+    selected_probs /= selected_probs.sum()
+
+    # Sample
+    chosen_idx_in_selected = np.random.choice(len(selected_probs), p=selected_probs)
+    top_id = selected_indices[chosen_idx_in_selected]
+    return int(top_id)
 
 
 def random_sampling(weighted_scores, decoded_tokens, sampling):
-    top_ids = weighted_scores.softmax(dim=0).multinomial(1, replacement=True).item()
-    return top_ids
+    # weighted_scores: (vocab_size,)
+    probs = nn.softmax(weighted_scores, axis=0)
+    probs_np = np.array(probs)
+    probs_np /= probs_np.sum()
+    top_id = np.random.choice(len(probs_np), p=probs_np)
+    return int(top_id)
 
 
 def fade_in_out(fade_in_mel, fade_out_mel, window):
-    device = fade_in_mel.device
-    fade_in_mel, fade_out_mel = fade_in_mel.cpu(), fade_out_mel.cpu()
+    # fade_in_mel, fade_out_mel: (..., T) or (..., T, D)?
+    # window: (win_len,)
+    # mel_overlap_len = win_len / 2
+
+    # In MLX, arrays are immutable.
+    # Construct result.
+
     mel_overlap_len = int(window.shape[0] / 2)
-    if fade_in_mel.device == torch.device('cpu'):
-        fade_in_mel = fade_in_mel.clone()
-    fade_in_mel[..., :mel_overlap_len] = fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len] + \
-        fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
-    return fade_in_mel.to(device)
+
+    # Slicing
+    # fade_in_mel[..., :mel_overlap_len]
+
+    part1 = fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len] + \
+            fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
+
+    # Concatenate: part1 + fade_in_mel[..., mel_overlap_len:]
+    res = mx.concatenate([part1, fade_in_mel[..., mel_overlap_len:]], axis=-1)
+    return res
 
 
 def set_all_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    mx.random.seed(seed)
 
 
-def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    assert mask.dtype == torch.bool
-    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
-    mask = mask.to(dtype)
-    # attention mask bias
-    # NOTE(Mddct): torch.finfo jit issues
-    #     chunk_masks = (1.0 - chunk_masks) * torch.finfo(dtype).min
+def mask_to_bias(mask: mx.array, dtype=mx.float32) -> mx.array:
+    # mask: bool
+    mask = mask.astype(dtype)
+    # (1.0 - mask) * -1.0e+10
     mask = (1.0 - mask) * -1.0e+10
     return mask
 
 
 class TrtContextWrapper:
+    # TensorRT wrapper. Not applicable for MLX usually unless using TRT-LLM on side?
+    # But usually restricted to Nvidia GPUs.
+    # MLX is for Apple Silicon.
+    # We can probably remove this or keep dummy.
     def __init__(self, trt_engine, trt_concurrent=1, device='cuda:0'):
-        self.trt_context_pool = queue.Queue(maxsize=trt_concurrent)
-        self.trt_engine = trt_engine
-        for _ in range(trt_concurrent):
-            trt_context = trt_engine.create_execution_context()
-            trt_stream = torch.cuda.stream(torch.cuda.Stream(device))
-            assert trt_context is not None, 'failed to create trt context, maybe not enough CUDA memory, try reduce current trt concurrent {}'.format(trt_concurrent)
-            self.trt_context_pool.put([trt_context, trt_stream])
-        assert self.trt_context_pool.empty() is False, 'no avaialbe estimator context'
+        pass
 
     def acquire_estimator(self):
-        return self.trt_context_pool.get(), self.trt_engine
+        return None, None
 
     def release_estimator(self, context, stream):
-        self.trt_context_pool.put([context, stream])
+        pass

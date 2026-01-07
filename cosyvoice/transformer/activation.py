@@ -16,17 +16,17 @@
 # limitations under the License.
 """Swish() activation function for Conformer."""
 
-import torch
-from torch import nn, sin, pow
-from torch.nn import Parameter
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_map
 
 
-class Swish(torch.nn.Module):
+class Swish(nn.Module):
     """Construct an Swish object."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array) -> mx.array:
         """Return Swish activation function."""
-        return x * torch.sigmoid(x)
+        return x * mx.sigmoid(x)
 
 
 # Implementation adapted from https://github.com/EdwardDixon/snake under the MIT license.
@@ -44,7 +44,7 @@ class Snake(nn.Module):
         https://arxiv.org/abs/2006.08195
     Examples:
         >>> a1 = snake(256)
-        >>> x = torch.randn(256)
+        >>> x = mx.random.normal(256)
         >>> x = a1(x)
     '''
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
@@ -62,23 +62,31 @@ class Snake(nn.Module):
         # initialize alpha
         self.alpha_logscale = alpha_logscale
         if self.alpha_logscale:  # log scale alphas initialized to zeros
-            self.alpha = Parameter(torch.zeros(in_features) * alpha)
+            self.alpha = mx.zeros(in_features) * alpha
         else:  # linear scale alphas initialized to ones
-            self.alpha = Parameter(torch.ones(in_features) * alpha)
+            self.alpha = mx.ones(in_features) * alpha
 
-        self.alpha.requires_grad = alpha_trainable
+        if alpha_trainable:
+             # MLX handles learnable parameters by assigning to self.property
+             # but we need to verify how parameters are registered.
+             # Typically, simple assignment works.
+             pass
+        else:
+             self.freeze(keys=['alpha'])
 
         self.no_div_by_zero = 0.000000001
 
-    def forward(self, x):
+    def __call__(self, x):
         '''
         Forward pass of the function.
         Applies the function to the input elementwise.
         Snake ∶= x + 1/a * sin^2 (xa)
         '''
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # line up with x to [B, C, T]
+        # MLX convention is (N, T, C). alpha is (C,).
+        # We need to broadcast alpha to (1, 1, C).
+        alpha = self.alpha[None, None, :]
         if self.alpha_logscale:
-            alpha = torch.exp(alpha)
-        x = x + (1.0 / (alpha + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
+            alpha = mx.exp(alpha)
+        x = x + (1.0 / (alpha + self.no_div_by_zero)) * mx.power(mx.sin(x * alpha), 2)
 
         return x

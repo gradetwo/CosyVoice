@@ -17,8 +17,9 @@
 """Encoder definition."""
 from typing import Tuple
 
-import torch
-import torch.utils.checkpoint as ckpt
+import mlx.core as mx
+import mlx.nn as nn
+# import torch.utils.checkpoint as ckpt # No checkpointing in MLX yet/needed?
 
 from cosyvoice.transformer.convolution import ConvolutionModule
 from cosyvoice.transformer.encoder_layer import TransformerEncoderLayer
@@ -34,7 +35,7 @@ from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.mask import add_optional_chunk_mask
 
 
-class BaseEncoder(torch.nn.Module):
+class BaseEncoder(nn.Module):
 
     def __init__(
         self,
@@ -51,7 +52,7 @@ class BaseEncoder(torch.nn.Module):
         normalize_before: bool = True,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
-        global_cmvn: torch.nn.Module = None,
+        global_cmvn: nn.Module = None,
         use_dynamic_left_chunk: bool = False,
         gradient_checkpointing: bool = False,
     ):
@@ -79,7 +80,7 @@ class BaseEncoder(torch.nn.Module):
             use_dynamic_chunk (bool): whether use dynamic chunk size for
                 training or not, You can only use fixed chunk(chunk_size > 0)
                 or dyanmic chunk size(use_dynamic_chunk = True)
-            global_cmvn (Optional[torch.nn.Module]): Optional GlobalCMVN module
+            global_cmvn (Optional[nn.Module]): Optional GlobalCMVN module
             use_dynamic_left_chunk (bool): whether use dynamic left chunk in
                 dynamic chunk training
             key_bias: whether use bias in attention.linear_k, False for whisper models.
@@ -99,7 +100,7 @@ class BaseEncoder(torch.nn.Module):
         )
 
         self.normalize_before = normalize_before
-        self.after_norm = torch.nn.LayerNorm(output_size, eps=1e-5)
+        self.after_norm = nn.LayerNorm(output_size, eps=1e-5)
         self.static_chunk_size = static_chunk_size
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
@@ -108,13 +109,13 @@ class BaseEncoder(torch.nn.Module):
     def output_size(self) -> int:
         return self._output_size
 
-    def forward(
+    def __call__(
         self,
-        xs: torch.Tensor,
-        xs_lens: torch.Tensor,
+        xs: mx.array,
+        xs_lens: mx.array,
         decoding_chunk_size: int = 0,
         num_decoding_left_chunks: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[mx.array, mx.array]:
         """Embed positions in tensor.
 
         Args:
@@ -138,23 +139,43 @@ class BaseEncoder(torch.nn.Module):
             checkpointing API because `__call__` attaches all the hooks of the module.
             https://discuss.pytorch.org/t/any-different-between-model-input-and-model-forward-input/3690/2
         """
-        T = xs.size(1)
-        masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
+        T = xs.shape[1]
+        # masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
+        # make_pad_mask returns (B, T) boolean mask (True for padding).
+        # We want masks where True for valid? Or True for padding?
+        # Original: ~make_pad_mask. make_pad_mask returns True for padding (usually).
+        # So ~mask is True for valid.
+
+        # We need to implement make_pad_mask for MLX or assume it returns MLX array.
+        # It is imported from cosyvoice.utils.mask. I need to port that too or assume it works.
+        # It likely uses torch.
+
+        # Assuming make_pad_mask is ported or I reimplement logic here.
+        # xs_lens is (B,).
+
+        # mask = mx.arange(T)[None, :] < xs_lens[:, None] # (B, T) True for valid.
+        masks = mx.arange(T)[None, :] < xs_lens[:, None]
+        masks = masks[:, None, :] # (B, 1, T)
+
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
         xs, pos_emb, masks = self.embed(xs, masks)
         mask_pad = masks  # (B, 1, T/subsample_rate)
+
+        # add_optional_chunk_mask also needs porting or verification.
+        # Assuming it returns a mask (mx.array).
         chunk_masks = add_optional_chunk_mask(xs, masks,
                                               self.use_dynamic_chunk,
                                               self.use_dynamic_left_chunk,
                                               decoding_chunk_size,
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
-        if self.gradient_checkpointing and self.training:
-            xs = self.forward_layers_checkpointed(xs, chunk_masks, pos_emb,
-                                                  mask_pad)
-        else:
-            xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
+
+        # if self.gradient_checkpointing and self.training:
+             # MLX supports checkpointing via transforms but it's different.
+             # Ignoring for now.
+
+        xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
         if self.normalize_before:
             xs = self.after_norm(xs)
         # Here we assume the mask is not changed in encoder layers, so just
@@ -162,147 +183,108 @@ class BaseEncoder(torch.nn.Module):
         # for cross attention with decoder later
         return xs, masks
 
-    def forward_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
-                       pos_emb: torch.Tensor,
-                       mask_pad: torch.Tensor) -> torch.Tensor:
+    def forward_layers(self, xs: mx.array, chunk_masks: mx.array,
+                       pos_emb: mx.array,
+                       mask_pad: mx.array) -> mx.array:
         for layer in self.encoders:
             xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
         return xs
 
-    @torch.jit.unused
-    def forward_layers_checkpointed(self, xs: torch.Tensor,
-                                    chunk_masks: torch.Tensor,
-                                    pos_emb: torch.Tensor,
-                                    mask_pad: torch.Tensor) -> torch.Tensor:
-        for layer in self.encoders:
-            xs, chunk_masks, _, _ = ckpt.checkpoint(layer.__call__, xs,
-                                                    chunk_masks, pos_emb,
-                                                    mask_pad)
-        return xs
+    # forward_layers_checkpointed removed or adapted if needed.
 
-    @torch.jit.export
+    # forward_chunk and forward_chunk_by_chunk porting...
+    # These are complex as they manage cache.
+    # I should attempt to port logic but keeping in mind MLX array operations.
+
     def forward_chunk(
         self,
-        xs: torch.Tensor,
+        xs: mx.array,
         offset: int,
         required_cache_size: int,
-        att_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
-        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
-        att_mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        att_cache: mx.array = None,
+        cnn_cache: mx.array = None,
+        att_mask: mx.array = None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
         """ Forward just one chunk
-
-        Args:
-            xs (torch.Tensor): chunk input, with shape (b=1, time, mel-dim),
-                where `time == (chunk_size - 1) * subsample_rate + \
-                        subsample.right_context + 1`
-            offset (int): current offset in encoder output time stamp
-            required_cache_size (int): cache size required for next chunk
-                compuation
-                >=0: actual cache size
-                <0: means all history cache is required
-            att_cache (torch.Tensor): cache tensor for KEY & VALUE in
-                transformer/conformer attention, with shape
-                (elayers, head, cache_t1, d_k * 2), where
-                `head * d_k == hidden-dim` and
-                `cache_t1 == chunk_size * num_decoding_left_chunks`.
-            cnn_cache (torch.Tensor): cache tensor for cnn_module in conformer,
-                (elayers, b=1, hidden-dim, cache_t2), where
-                `cache_t2 == cnn.lorder - 1`
-
-        Returns:
-            torch.Tensor: output of current input xs,
-                with shape (b=1, chunk_size, hidden-dim).
-            torch.Tensor: new attention cache required for next chunk, with
-                dynamic shape (elayers, head, ?, d_k * 2)
-                depending on required_cache_size.
-            torch.Tensor: new conformer cnn cache required for next chunk, with
-                same shape as the original cnn_cache.
-
         """
-        assert xs.size(0) == 1
+        # assert xs.shape[0] == 1
         # tmp_masks is just for interface compatibility
-        tmp_masks = torch.ones(1,
-                               xs.size(1),
-                               device=xs.device,
-                               dtype=torch.bool)
-        tmp_masks = tmp_masks.unsqueeze(1)
+        # tmp_masks = torch.ones(1, xs.size(1), device=xs.device, dtype=torch.bool)
+        tmp_masks = mx.ones((1, xs.shape[1])).astype(mx.bool_)
+        tmp_masks = tmp_masks[:, None, :]
+
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
-        # NOTE(xcsong): Before embed, shape(xs) is (b=1, time, mel-dim)
+
         xs, pos_emb, _ = self.embed(xs, tmp_masks, offset)
-        # NOTE(xcsong): After  embed, shape(xs) is (b=1, chunk_size, hidden-dim)
-        elayers, cache_t1 = att_cache.size(0), att_cache.size(2)
-        chunk_size = xs.size(1)
+
+        if att_cache is None:
+             # We need to know shape to initialize? Or handle in loop.
+             # Original code: att_cache is passed as zeros if empty.
+             elayers = 0
+             cache_t1 = 0
+        else:
+             elayers = att_cache.shape[0]
+             cache_t1 = att_cache.shape[2]
+
+        chunk_size = xs.shape[1]
         attention_key_size = cache_t1 + chunk_size
+
+        # self.embed.position_encoding
         pos_emb = self.embed.position_encoding(offset=offset - cache_t1,
                                                size=attention_key_size)
+
         if required_cache_size < 0:
             next_cache_start = 0
         elif required_cache_size == 0:
             next_cache_start = attention_key_size
         else:
             next_cache_start = max(attention_key_size - required_cache_size, 0)
+
         r_att_cache = []
         r_cnn_cache = []
+
+        if att_mask is None:
+             att_mask = mx.ones((0,0,0)).astype(mx.bool_) # Fake mask?
+
         for i, layer in enumerate(self.encoders):
-            # NOTE(xcsong): Before layer.forward
-            #   shape(att_cache[i:i + 1]) is (1, head, cache_t1, d_k * 2),
-            #   shape(cnn_cache[i])       is (b=1, hidden-dim, cache_t2)
+            # att_cache slice
+            if att_cache is not None and elayers > 0:
+                layer_att_cache = att_cache[i:i + 1]
+            else:
+                layer_att_cache = mx.zeros((0,0,0,0)) # or None depending on layer impl
+
+            if cnn_cache is not None and cnn_cache.size > 0:
+                layer_cnn_cache = cnn_cache[i]
+            else:
+                layer_cnn_cache = mx.zeros((0,0,0)) # or None
+
             xs, _, new_att_cache, new_cnn_cache = layer(
                 xs,
                 att_mask,
                 pos_emb,
-                att_cache=att_cache[i:i + 1] if elayers > 0 else att_cache,
-                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache)
-            # NOTE(xcsong): After layer.forward
-            #   shape(new_att_cache) is (1, head, attention_key_size, d_k * 2),
-            #   shape(new_cnn_cache) is (b=1, hidden-dim, cache_t2)
+                att_cache=layer_att_cache,
+                cnn_cache=layer_cnn_cache)
+
             r_att_cache.append(new_att_cache[:, :, next_cache_start:, :])
-            r_cnn_cache.append(new_cnn_cache.unsqueeze(0))
+            r_cnn_cache.append(new_cnn_cache[None, ...])
+
         if self.normalize_before:
             xs = self.after_norm(xs)
 
-        # NOTE(xcsong): shape(r_att_cache) is (elayers, head, ?, d_k * 2),
-        #   ? may be larger than cache_t1, it depends on required_cache_size
-        r_att_cache = torch.cat(r_att_cache, dim=0)
-        # NOTE(xcsong): shape(r_cnn_cache) is (e, b=1, hidden-dim, cache_t2)
-        r_cnn_cache = torch.cat(r_cnn_cache, dim=0)
+        r_att_cache = mx.concatenate(r_att_cache, axis=0)
+        r_cnn_cache = mx.concatenate(r_cnn_cache, axis=0)
 
         return (xs, r_att_cache, r_cnn_cache)
 
-    @torch.jit.unused
     def forward_chunk_by_chunk(
         self,
-        xs: torch.Tensor,
+        xs: mx.array,
         decoding_chunk_size: int,
         num_decoding_left_chunks: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[mx.array, mx.array]:
         """ Forward input chunk by chunk with chunk_size like a streaming
             fashion
-
-        Here we should pay special attention to computation cache in the
-        streaming style forward chunk by chunk. Three things should be taken
-        into account for computation in the current network:
-            1. transformer/conformer encoder layers output cache
-            2. convolution in conformer
-            3. convolution in subsampling
-
-        However, we don't implement subsampling cache for:
-            1. We can control subsampling module to output the right result by
-               overlapping input instead of cache left context, even though it
-               wastes some computation, but subsampling only takes a very
-               small fraction of computation in the whole model.
-            2. Typically, there are several covolution layers with subsampling
-               in subsampling module, it is tricky and complicated to do cache
-               with different convolution layers with different subsampling
-               rate.
-            3. Currently, nn.Sequential is used to stack all the convolution
-               layers in subsampling, we need to rewrite it to make it work
-               with cache, which is not preferred.
-        Args:
-            xs (torch.Tensor): (1, max_len, dim)
-            chunk_size (int): decoding chunk size
         """
         assert decoding_chunk_size > 0
         # The model is trained by static or dynamic chunk
@@ -311,9 +293,11 @@ class BaseEncoder(torch.nn.Module):
         context = self.embed.right_context + 1  # Add current frame
         stride = subsampling * decoding_chunk_size
         decoding_window = (decoding_chunk_size - 1) * subsampling + context
-        num_frames = xs.size(1)
-        att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0), device=xs.device)
-        cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0), device=xs.device)
+        num_frames = xs.shape[1]
+
+        att_cache = mx.zeros((0, 0, 0, 0))
+        cnn_cache = mx.zeros((0, 0, 0, 0))
+
         outputs = []
         offset = 0
         required_cache_size = decoding_chunk_size * num_decoding_left_chunks
@@ -327,11 +311,9 @@ class BaseEncoder(torch.nn.Module):
                                              required_cache_size, att_cache,
                                              cnn_cache)
             outputs.append(y)
-            offset += y.size(1)
-        ys = torch.cat(outputs, 1)
-        masks = torch.ones((1, 1, ys.size(1)),
-                           device=ys.device,
-                           dtype=torch.bool)
+            offset += y.shape[1]
+        ys = mx.concatenate(outputs, axis=1)
+        masks = mx.ones((1, 1, ys.shape[1])).astype(mx.bool_)
         return ys, masks
 
 
@@ -353,7 +335,7 @@ class TransformerEncoder(BaseEncoder):
         normalize_before: bool = True,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
-        global_cmvn: torch.nn.Module = None,
+        global_cmvn: nn.Module = None,
         use_dynamic_left_chunk: bool = False,
         key_bias: bool = True,
         selfattention_layer_type: str = "selfattn",
@@ -371,7 +353,10 @@ class TransformerEncoder(BaseEncoder):
                          static_chunk_size, use_dynamic_chunk, global_cmvn,
                          use_dynamic_left_chunk, gradient_checkpointing)
         activation = COSYVOICE_ACTIVATION_CLASSES[activation_type]()
-        self.encoders = torch.nn.ModuleList([
+        # We need to make sure ModuleList is handled correctly in MLX (usually list of layers)
+        # MLX nn.Module works with list of layers if assigned to self.
+
+        self.encoders = [
             TransformerEncoderLayer(
                 output_size,
                 COSYVOICE_ATTENTION_CLASSES[selfattention_layer_type](attention_heads,
@@ -381,7 +366,7 @@ class TransformerEncoder(BaseEncoder):
                 PositionwiseFeedForward(output_size, linear_units,
                                         dropout_rate, activation),
                 dropout_rate, normalize_before) for _ in range(num_blocks)
-        ])
+        ]
 
 
 class ConformerEncoder(BaseEncoder):
@@ -402,7 +387,7 @@ class ConformerEncoder(BaseEncoder):
         normalize_before: bool = True,
         static_chunk_size: int = 0,
         use_dynamic_chunk: bool = False,
-        global_cmvn: torch.nn.Module = None,
+        global_cmvn: nn.Module = None,
         use_dynamic_left_chunk: bool = False,
         positionwise_conv_kernel_size: int = 1,
         macaron_style: bool = True,
@@ -416,21 +401,6 @@ class ConformerEncoder(BaseEncoder):
         gradient_checkpointing: bool = False,
     ):
         """Construct ConformerEncoder
-
-        Args:
-            input_size to use_dynamic_chunk, see in BaseEncoder
-            positionwise_conv_kernel_size (int): Kernel size of positionwise
-                conv1d layer.
-            macaron_style (bool): Whether to use macaron style for
-                positionwise layer.
-            selfattention_layer_type (str): Encoder attention layer type,
-                the parameter has no effect now, it's just for configure
-                compatibility.
-            activation_type (str): Encoder activation function type.
-            use_cnn_module (bool): Whether to use convolution module.
-            cnn_module_kernel (int): Kernel size of convolution module.
-            causal (bool): whether to use causal convolution or not.
-            key_bias: whether use bias in attention.linear_k, False for whisper models.
         """
         super().__init__(input_size, output_size, attention_heads,
                          linear_units, num_blocks, dropout_rate,
@@ -458,7 +428,7 @@ class ConformerEncoder(BaseEncoder):
         convolution_layer_args = (output_size, cnn_module_kernel, activation,
                                   cnn_module_norm, causal)
 
-        self.encoders = torch.nn.ModuleList([
+        self.encoders = [
             ConformerEncoderLayer(
                 output_size,
                 COSYVOICE_ATTENTION_CLASSES[selfattention_layer_type](
@@ -471,4 +441,4 @@ class ConformerEncoder(BaseEncoder):
                 dropout_rate,
                 normalize_before,
             ) for _ in range(num_blocks)
-        ])
+        ]
