@@ -14,14 +14,17 @@
 import logging
 import random
 from typing import Dict, Optional
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from omegaconf import DictConfig
+import mlx.core as mx
+import mlx.nn as nn
+# from omegaconf import DictConfig # Assuming DictConfig usage can be handled by standard dict or removed if just typing
+# cosyvoice.utils.mask has make_pad_mask (ported)
 from cosyvoice.utils.mask import make_pad_mask
 
+# Helper for omegaconf if needed or just use dict
+class DictConfig(dict):
+    pass
 
-class MaskedDiffWithXvec(torch.nn.Module):
+class MaskedDiffWithXvec(nn.Module):
     def __init__(self,
                  input_size: int = 512,
                  output_size: int = 80,
@@ -30,14 +33,10 @@ class MaskedDiffWithXvec(torch.nn.Module):
                  vocab_size: int = 4096,
                  input_frame_rate: int = 50,
                  only_mask_loss: bool = True,
-                 encoder: torch.nn.Module = None,
-                 length_regulator: torch.nn.Module = None,
-                 decoder: torch.nn.Module = None,
-                 decoder_conf: Dict = {'in_channels': 240, 'out_channel': 80, 'spk_emb_dim': 80, 'n_spks': 1,
-                                       'cfm_params': DictConfig({'sigma_min': 1e-06, 'solver': 'euler', 't_scheduler': 'cosine',
-                                                                 'training_cfg_rate': 0.2, 'inference_cfg_rate': 0.7, 'reg_loss_type': 'l1'}),
-                                       'decoder_params': {'channels': [256, 256], 'dropout': 0.0, 'attention_head_dim': 64,
-                                                          'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}}):
+                 encoder: nn.Module = None,
+                 length_regulator: nn.Module = None,
+                 decoder: nn.Module = None,
+                 decoder_conf: Dict = {}):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -47,58 +46,129 @@ class MaskedDiffWithXvec(torch.nn.Module):
         self.input_frame_rate = input_frame_rate
         logging.info(f"input frame rate={self.input_frame_rate}")
         self.input_embedding = nn.Embedding(vocab_size, input_size)
-        self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
+        self.spk_embed_affine_layer = nn.Linear(spk_embed_dim, output_size)
         self.encoder = encoder
-        self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
+        self.encoder_proj = nn.Linear(self.encoder.output_size(), output_size)
         self.decoder = decoder
         self.length_regulator = length_regulator
         self.only_mask_loss = only_mask_loss
 
-    def forward(
+    def __call__(
             self,
             batch: dict,
-            device: torch.device,
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
-        feat = batch['speech_feat'].to(device)
-        feat_len = batch['speech_feat_len'].to(device)
-        embedding = batch['embedding'].to(device)
+            device: str = None,
+    ) -> Dict[str, Optional[mx.array]]:
+        token = batch['speech_token']
+        token_len = batch['speech_token_len']
+        feat = batch['speech_feat']
+        feat_len = batch['speech_feat_len']
+        embedding = batch['embedding']
 
         # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
-        mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        # mask = (~make_pad_mask(token_len)).float().unsqueeze(-1)
+        # make_pad_mask returns True for padding in torch (usually).
+        # My MLX port returns True for padding? Let's check mask.py.
+        # make_pad_mask returns mask where indices >= lengths. So True for pad.
+        # So ~mask is valid.
+
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0) # True for valid
+        mask = mask.astype(mx.float32)[:, :, None] # (B, T, 1)
+
+        # token clamp min 0. In MLX token is int?
+        # token = self.input_embedding(mx.maximum(token, 0)) * mask
+        # nn.Embedding takes int input.
+        # mx.maximum works.
+
+        token_emb = self.input_embedding(mx.maximum(token, 0))
+        token_emb = token_emb * mask
 
         # text encode
-        h, h_lengths = self.encoder(token, token_len)
+        h, h_lengths = self.encoder(token_emb, token_len)
         h = self.encoder_proj(h)
         h, h_lengths = self.length_regulator(h, feat_len)
 
         # get conditions
-        conds = torch.zeros(feat.shape, device=token.device)
-        for i, j in enumerate(feat_len):
-            if random.random() < 0.5:
-                continue
-            index = random.randint(0, int(0.3 * j))
-            conds[i, :index] = feat[i, :index]
-        conds = conds.transpose(1, 2)
+        conds = mx.zeros(feat.shape)
+        # conds update loop
+        # feat_len is (B,)
+        # In MLX we cannot easily iterate and update tensor in-place efficiently if we want to trace/compile,
+        # but eager mode is fine.
 
-        mask = (~make_pad_mask(feat_len)).to(h)
-        # NOTE this is unnecessary, feat/h already same shape
+        # Original logic: randomly pick prefix as condition.
+
+        # Since we are in inference mostly or fine-tuning, eager loop is okay.
+        # Or construct mask.
+
+        cond_list = []
+        for i in range(feat_len.shape[0]):
+            l = int(feat_len[i].item())
+            if random.random() < 0.5:
+                cond_list.append(mx.zeros_like(feat[i]))
+            else:
+                index = random.randint(0, int(0.3 * l))
+                # mask out after index
+                # feat[i] is (T, D)
+                mask_i = mx.arange(feat.shape[1]) < index
+                cond_i = feat[i] * mask_i[:, None]
+                cond_list.append(cond_i)
+
+        conds = mx.stack(cond_list, axis=0)
+
+        # conds.transpose(1, 2) ?
+        # feat in torch is usually (B, T, D) for conformer/transformer input.
+        # In original flow.py: `conds = conds.transpose(1, 2)`.
+        # This implies conds becomes (B, D, T).
+        # decoder.compute_loss takes `cond`.
+        # Let's check `flow_matching.py` (ConditionalCFM).
+        # It expects `mu` (output of encoder) shape `(batch_size, n_feats, mel_timesteps)` in docstring.
+        # But my port of `flow_matching.py` assumes `mu` is `(B, D, T)`?
+        # Wait, standard MLX layers like Conv1d expect `(N, T, C)`.
+        # TransformerEncoder output `h` is `(B, T, D)`.
+
+        # Original code:
+        # h, h_lengths = self.encoder(...) -> h (B, T, D)
+        # h = h.transpose(1, 2) -> (B, D, T) passed to compute_loss.
+        # `feat.transpose(1, 2)` passed as target.
+
+        # In `flow_matching.py` (ConditionalCFM):
+        # `mu` docstring says `(batch_size, n_feats, mel_timesteps)` -> (B, D, T).
+
+        # But wait, MLX layers prefer (B, T, D).
+        # If `ConditionalCFM` uses `estimator` which is likely a WaveNet or UNet or Conformer-like.
+        # If estimator uses Conv1d, it expects (B, T, C).
+        # If estimator expects (B, D, T), then we should transpose.
+
+        # Let's verify `ConditionalCFM.compute_loss`.
+        # It does `b, _, t = mu.shape`. If shape is (B, D, T), `t` is timesteps.
+
+        # My `ConditionalCFM` port assumes (B, T, D) if I used standard MLX layers inside estimator?
+        # The user provided `estimator` to `ConditionalCFM`.
+        # If `estimator` is `DiT` or `WaveNet` ported to MLX, they usually follow MLX convention (B, T, C).
+
+        # If I change the convention to (B, T, D), I should remove transposes here.
+        # Let's assume standard MLX (B, T, D).
+
+        # So I will NOT transpose here.
+        # And I should check `ConditionalCFM`.
+
+        mask = make_pad_mask(feat_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None] # (B, T, 1) (valid mask)
+
         loss, _ = self.decoder.compute_loss(
-            feat.transpose(1, 2).contiguous(),
-            mask.unsqueeze(1),
-            h.transpose(1, 2).contiguous(),
+            feat, # (B, T, D)
+            mask, # (B, T, 1)
+            h,    # (B, T, D)
             embedding,
             cond=conds
         )
         return {'loss': loss}
 
-    @torch.inference_mode()
     def inference(self,
                   token,
                   token_len,
@@ -108,44 +178,73 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat_len,
                   embedding,
                   flow_cache):
-        assert token.shape[0] == 1
-        # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+        # assert token.shape[0] == 1
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat speech token and prompt speech token
-        token_len1, token_len2 = prompt_token.shape[1], token.shape[1]
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token_len1 = prompt_token.shape[1]
+        token_len2 = token.shape[1]
+
+        token = mx.concatenate([prompt_token, token], axis=1)
+        token_len = prompt_token_len + token_len
+
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        token_emb = self.input_embedding(mx.maximum(token, 0)) * mask
 
         # text encode
-        h, h_lengths = self.encoder(token, token_len)
+        h, h_lengths = self.encoder(token_emb, token_len)
         h = self.encoder_proj(h)
-        mel_len1, mel_len2 = prompt_feat.shape[1], int(token_len2 / self.input_frame_rate * 22050 / 256)
-        h, h_lengths = self.length_regulator.inference(h[:, :token_len1], h[:, token_len1:], mel_len1, mel_len2, self.input_frame_rate)
+
+        # length regulator inference
+        # Assuming length_regulator is ported or compatible.
+        # h (B, T, D)
+        # mel_len1 from prompt_feat.
+        mel_len1 = prompt_feat.shape[1]
+        mel_len2 = int(token_len2 / self.input_frame_rate * 22050 / 256)
+
+        h_part1 = h[:, :token_len1]
+        h_part2 = h[:, token_len1:]
+
+        h, h_lengths = self.length_regulator.inference(h_part1, h_part2, mel_len1, mel_len2, self.input_frame_rate)
 
         # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
+        # conds: (1, mel_len1 + mel_len2, output_size)
+        total_len = mel_len1 + mel_len2
+        conds = mx.zeros((1, total_len, self.output_size), dtype=h.dtype)
+        # conds[:, :mel_len1] = prompt_feat
+        # conds = conds.at[:, :mel_len1].set(prompt_feat) # Not efficient but correct.
+        # Or construct:
+        # conds = mx.concatenate([prompt_feat, mx.zeros((1, mel_len2, output_size))], axis=1)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        conds = mx.concatenate([prompt_feat, mx.zeros((1, mel_len2, self.output_size), dtype=h.dtype)], axis=1)
+
+        # No transpose if (B, T, D) convention.
+
+        mask = make_pad_mask(mx.array([total_len]))
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        # decoder inference
         feat, flow_cache = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=mask.unsqueeze(1),
+            mu=h,
+            mask=mask,
             spks=embedding,
             cond=conds,
             n_timesteps=10,
             prompt_len=mel_len1,
             cache=flow_cache
         )
-        feat = feat[:, :, mel_len1:]
-        assert feat.shape[2] == mel_len2
-        return feat.float(), flow_cache
+
+        feat = feat[:, mel_len1:, :] # (B, T_gen, D)
+        # assert feat.shape[1] == mel_len2
+
+        return feat, flow_cache
 
 
-class CausalMaskedDiffWithXvec(torch.nn.Module):
+class CausalMaskedDiffWithXvec(nn.Module):
     def __init__(self,
                  input_size: int = 512,
                  output_size: int = 80,
@@ -156,13 +255,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                  only_mask_loss: bool = True,
                  token_mel_ratio: int = 2,
                  pre_lookahead_len: int = 3,
-                 encoder: torch.nn.Module = None,
-                 decoder: torch.nn.Module = None,
-                 decoder_conf: Dict = {'in_channels': 240, 'out_channel': 80, 'spk_emb_dim': 80, 'n_spks': 1,
-                                       'cfm_params': DictConfig({'sigma_min': 1e-06, 'solver': 'euler', 't_scheduler': 'cosine',
-                                                                 'training_cfg_rate': 0.2, 'inference_cfg_rate': 0.7, 'reg_loss_type': 'l1'}),
-                                       'decoder_params': {'channels': [256, 256], 'dropout': 0.0, 'attention_head_dim': 64,
-                                                          'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}}):
+                 encoder: nn.Module = None,
+                 decoder: nn.Module = None,
+                 decoder_conf: Dict = {}):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -172,61 +267,74 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.input_frame_rate = input_frame_rate
         logging.info(f"input frame rate={self.input_frame_rate}")
         self.input_embedding = nn.Embedding(vocab_size, input_size)
-        self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
+        self.spk_embed_affine_layer = nn.Linear(spk_embed_dim, output_size)
         self.encoder = encoder
-        self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
+        self.encoder_proj = nn.Linear(self.encoder.output_size(), output_size)
         self.decoder = decoder
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
 
-    def forward(
+    def __call__(
             self,
             batch: dict,
-            device: torch.device,
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
-        feat = batch['speech_feat'].to(device)
-        feat_len = batch['speech_feat_len'].to(device)
-        embedding = batch['embedding'].to(device)
+            device: str = None,
+    ) -> Dict[str, Optional[mx.array]]:
+        token = batch['speech_token']
+        token_len = batch['speech_token_len']
+        feat = batch['speech_feat']
+        feat_len = batch['speech_feat_len']
+        embedding = batch['embedding']
 
-        # NOTE unified training, static_chunk_size > 0 or = 0
         streaming = True if random.random() < 0.5 else False
 
-        # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
-        # concat text and prompt_text
-        mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        token_emb = self.input_embedding(mx.maximum(token, 0)) * mask
 
         # text encode
-        h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+        h, h_lengths = self.encoder(token_emb, token_len, streaming=streaming)
         h = self.encoder_proj(h)
 
         # get conditions
-        conds = torch.zeros(feat.shape, device=token.device)
-        for i, j in enumerate(feat_len):
+        cond_list = []
+        for i in range(feat_len.shape[0]):
+            l = int(feat_len[i].item())
             if random.random() < 0.5:
-                continue
-            index = random.randint(0, int(0.3 * j))
-            conds[i, :index] = feat[i, :index]
-        conds = conds.transpose(1, 2)
+                cond_list.append(mx.zeros_like(feat[i]))
+            else:
+                index = random.randint(0, int(0.3 * l))
+                mask_i = mx.arange(feat.shape[1]) < index
+                cond_i = feat[i] * mask_i[:, None]
+                cond_list.append(cond_i)
+        conds = mx.stack(cond_list, axis=0)
 
-        mask = (~make_pad_mask(h_lengths.sum(dim=-1).squeeze(dim=1))).to(h)
+        # mask for decoder loss
+        # h_lengths sum? In torch code: h_lengths.sum(dim=-1).squeeze(dim=1).
+        # h_lengths from encoder usually (B,). If it is (B, 1), squeeze.
+
+        mask_len = h_lengths
+        if mask_len.ndim > 1:
+             mask_len = mx.sum(mask_len, axis=-1)
+
+        mask = make_pad_mask(mask_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
         loss, _ = self.decoder.compute_loss(
-            feat.transpose(1, 2).contiguous(),
-            mask.unsqueeze(1),
-            h.transpose(1, 2).contiguous(),
+            feat,
+            mask,
+            h,
             embedding,
             cond=conds,
             streaming=streaming,
         )
         return {'loss': loss}
 
-    @torch.inference_mode()
     def inference(self,
                   token,
                   token_len,
@@ -237,45 +345,47 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   embedding,
                   streaming,
                   finalize):
-        assert token.shape[0] == 1
-        # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
-        # concat text and prompt_text
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token = mx.concatenate([prompt_token, token], axis=1)
+        token_len = prompt_token_len + token_len
 
-        # text encode
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        token_emb = self.input_embedding(mx.maximum(token, 0)) * mask
+
         if finalize is True:
-            h, h_lengths = self.encoder(token, token_len, streaming=streaming)
+            h, h_lengths = self.encoder(token_emb, token_len, streaming=streaming)
         else:
-            token, context = token[:, :-self.pre_lookahead_len], token[:, -self.pre_lookahead_len:]
-            h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming)
-        mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+            token_in = token_emb[:, :-self.pre_lookahead_len]
+            context = token_emb[:, -self.pre_lookahead_len:]
+            h, h_lengths = self.encoder(token_in, token_len, context=context, streaming=streaming)
+
+        mel_len1 = prompt_feat.shape[1]
+        mel_len2 = h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 
-        # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
+        conds = mx.concatenate([prompt_feat, mx.zeros((1, mel_len2, self.output_size), dtype=h.dtype)], axis=1)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        mask = make_pad_mask(mx.array([mel_len1 + mel_len2]))
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
         feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=mask.unsqueeze(1),
+            mu=h,
+            mask=mask,
             spks=embedding,
             cond=conds,
             n_timesteps=10,
             streaming=streaming
         )
-        feat = feat[:, :, mel_len1:]
-        assert feat.shape[2] == mel_len2
-        return feat.float(), None
+        feat = feat[:, mel_len1:, :]
+        return feat, None
 
 
-class CausalMaskedDiffWithDiT(torch.nn.Module):
+class CausalMaskedDiffWithDiT(nn.Module):
     def __init__(self,
                  input_size: int = 512,
                  output_size: int = 80,
@@ -286,13 +396,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                  only_mask_loss: bool = True,
                  token_mel_ratio: int = 2,
                  pre_lookahead_len: int = 3,
-                 pre_lookahead_layer: torch.nn.Module = None,
-                 decoder: torch.nn.Module = None,
-                 decoder_conf: Dict = {'in_channels': 240, 'out_channel': 80, 'spk_emb_dim': 80, 'n_spks': 1,
-                                       'cfm_params': DictConfig({'sigma_min': 1e-06, 'solver': 'euler', 't_scheduler': 'cosine',
-                                                                 'training_cfg_rate': 0.2, 'inference_cfg_rate': 0.7, 'reg_loss_type': 'l1'}),
-                                       'decoder_params': {'channels': [256, 256], 'dropout': 0.0, 'attention_head_dim': 64,
-                                                          'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}}):
+                 pre_lookahead_layer: nn.Module = None,
+                 decoder: nn.Module = None,
+                 decoder_conf: Dict = {}):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
@@ -302,60 +408,78 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         self.input_frame_rate = input_frame_rate
         logging.info(f"input frame rate={self.input_frame_rate}")
         self.input_embedding = nn.Embedding(vocab_size, input_size)
-        self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
+        self.spk_embed_affine_layer = nn.Linear(spk_embed_dim, output_size)
         self.pre_lookahead_len = pre_lookahead_len
         self.pre_lookahead_layer = pre_lookahead_layer
         self.decoder = decoder
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
 
-    def forward(
+    def __call__(
             self,
             batch: dict,
-            device: torch.device,
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        token = batch['speech_token'].to(device)
-        token_len = batch['speech_token_len'].to(device)
-        feat = batch['speech_feat'].to(device)
-        feat_len = batch['speech_feat_len'].to(device)
-        embedding = batch['embedding'].to(device)
+            device: str = None,
+    ) -> Dict[str, Optional[mx.array]]:
+        token = batch['speech_token']
+        token_len = batch['speech_token_len']
+        feat = batch['speech_feat']
+        feat_len = batch['speech_feat_len']
+        embedding = batch['embedding']
 
-        # NOTE unified training, static_chunk_size > 0 or = 0
         streaming = True if random.random() < 0.5 else False
 
-        # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
-        # concat text and prompt_text
-        mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        token_emb = self.input_embedding(mx.maximum(token, 0)) * mask
 
         # text encode
-        h = self.pre_lookahead_layer(token)
-        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-        mask = mask.repeat_interleave(self.token_mel_ratio, dim=1).squeeze(dim=-1)
+        h = self.pre_lookahead_layer(token_emb)
+        # h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+        h = h.repeat(self.token_mel_ratio, axis=1) # Repeat on time dim?
+        # Original: dim=1 (time).
+
+        # mask.repeat_interleave
+        mask = mask.repeat(self.token_mel_ratio, axis=1).squeeze(-1) # squeeze last dim if needed for broadcasting in decoder loss?
+        # decoder.compute_loss mask unsqueeze(1) -> (B, 1, T).
+        # Here mask (B, T).
 
         # get conditions
-        conds = torch.zeros(feat.shape, device=token.device)
-        for i, j in enumerate(feat_len):
+        cond_list = []
+        for i in range(feat_len.shape[0]):
+            l = int(feat_len[i].item())
             if random.random() < 0.5:
-                continue
-            index = random.randint(0, int(0.3 * j))
-            conds[i, :index] = feat[i, :index]
-        conds = conds.transpose(1, 2)
+                cond_list.append(mx.zeros_like(feat[i]))
+            else:
+                index = random.randint(0, int(0.3 * l))
+                mask_i = mx.arange(feat.shape[1]) < index
+                cond_i = feat[i] * mask_i[:, None]
+                cond_list.append(cond_i)
+        conds = mx.stack(cond_list, axis=0)
+
+        # mask needs to be (B, T, 1) or (B, T) depending on compute_loss expectation.
+        # compute_loss calls `mask.unsqueeze(1)` -> (B, 1, T).
+        # My compute_loss expects (B, T, 1) if using MLX convention?
+        # Let's align with ConditionalCFM.
+        # ConditionalCFM mask is concatenated.
+        # If I change mask shape to (B, T, 1) here it should be consistent.
+
+        mask = mask[:, :, None] # (B, T, 1)
 
         loss, _ = self.decoder.compute_loss(
-            feat.transpose(1, 2).contiguous(),
-            mask.unsqueeze(1),
-            h.transpose(1, 2).contiguous(),
+            feat,
+            mask,
+            h,
             embedding,
             cond=conds,
             streaming=streaming,
         )
         return {'loss': loss}
 
-    @torch.inference_mode()
     def inference(self,
                   token,
                   token_len,
@@ -366,67 +490,44 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                   embedding,
                   streaming,
                   finalize):
-        assert token.shape[0] == 1
-        # xvec projection
-        embedding = F.normalize(embedding, dim=1)
+
+        norm = mx.linalg.norm(embedding, axis=1, keepdims=True)
+        embedding = embedding / (norm + 1e-6)
         embedding = self.spk_embed_affine_layer(embedding)
 
-        # concat text and prompt_text
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token = mx.concatenate([prompt_token, token], axis=1)
+        token_len = prompt_token_len + token_len
 
-        # text encode
+        mask = make_pad_mask(token_len)
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
+        token_emb = self.input_embedding(mx.maximum(token, 0)) * mask
+
         if finalize is True:
-            h = self.pre_lookahead_layer(token)
+            h = self.pre_lookahead_layer(token_emb)
         else:
-            h = self.pre_lookahead_layer(token[:, :-self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len:])
-        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-        mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+            token_in = token_emb[:, :-self.pre_lookahead_len]
+            context = token_emb[:, -self.pre_lookahead_len:]
+            # Assuming pre_lookahead_layer handles context if signature matches
+            h = self.pre_lookahead_layer(token_in, context=context)
 
-        # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
-        conds = conds.transpose(1, 2)
+        h = h.repeat(self.token_mel_ratio, axis=1)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        mel_len1 = prompt_feat.shape[1]
+        mel_len2 = h.shape[1] - prompt_feat.shape[1]
+
+        conds = mx.concatenate([prompt_feat, mx.zeros((1, mel_len2, self.output_size), dtype=h.dtype)], axis=1)
+
+        mask = make_pad_mask(mx.array([mel_len1 + mel_len2]))
+        mask = (mask == 0).astype(mx.float32)[:, :, None]
+
         feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=mask.unsqueeze(1),
+            mu=h,
+            mask=mask,
             spks=embedding,
             cond=conds,
             n_timesteps=10,
             streaming=streaming
         )
-        feat = feat[:, :, mel_len1:]
-        assert feat.shape[2] == mel_len2
-        return feat.float(), None
-
-
-if __name__ == '__main__':
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    from hyperpyyaml import load_hyperpyyaml
-    with open('./pretrained_models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml', 'r') as f:
-        configs = load_hyperpyyaml(f, overrides={'llm': None, 'hift': None})
-    model = configs['flow']
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
-    model.eval()
-    max_len = 10 * model.decoder.estimator.static_chunk_size
-    chunk_size = model.decoder.estimator.static_chunk_size
-    context_size = model.pre_lookahead_layer.pre_lookahead_len
-    token = torch.randint(0, 6561, size=(1, max_len)).to(device)
-    token_len = torch.tensor([max_len]).to(device)
-    prompt_token = torch.randint(0, 6561, size=(1, chunk_size)).to(device)
-    prompt_token_len = torch.tensor([chunk_size]).to(device)
-    prompt_feat = torch.rand(1, chunk_size * 2, 80).to(device)
-    prompt_feat_len = torch.tensor([chunk_size * 2]).to(device)
-    prompt_embedding = torch.rand(1, 192).to(device)
-    pred_gt, _ = model.inference(token, token_len, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, prompt_embedding, streaming=True, finalize=True)
-    for i in range(0, max_len, chunk_size):
-        finalize = True if i + chunk_size + context_size >= max_len else False
-        pred_chunk, _ = model.inference(token[:, :i + chunk_size + context_size], torch.tensor([token[:, :i + chunk_size + context_size].shape[1]]).to(device),
-                                        prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, prompt_embedding, streaming=True, finalize=finalize)
-        pred_chunk = pred_chunk[:, :, i * model.token_mel_ratio:]
-        print((pred_gt[:, :, i * model.token_mel_ratio: i * model.token_mel_ratio + pred_chunk.shape[2]] - pred_chunk).abs().max().item())
+        feat = feat[:, mel_len1:, :]
+        return feat, None

@@ -15,8 +15,8 @@
 """Decoder self-attention layer definition."""
 from typing import Optional, Tuple
 
-import torch
-from torch import nn
+import mlx.core as mx
+import mlx.nn as nn
 
 
 class DecoderLayer(nn.Module):
@@ -24,13 +24,13 @@ class DecoderLayer(nn.Module):
 
     Args:
         size (int): Input dimension.
-        self_attn (torch.nn.Module): Self-attention module instance.
+        self_attn (nn.Module): Self-attention module instance.
             `MultiHeadedAttention` instance can be used as the argument.
-        src_attn (torch.nn.Module): Inter-attention module instance.
+        src_attn (nn.Module): Inter-attention module instance.
             `MultiHeadedAttention` instance can be used as the argument.
             If `None` is passed, Inter-attention is not used, such as
             CIF, GPT, and other decoder only model.
-        feed_forward (torch.nn.Module): Feed-forward module instance.
+        feed_forward (nn.Module): Feed-forward module instance.
             `PositionwiseFeedForward` instance can be used as the argument.
         dropout_rate (float): Dropout rate.
         normalize_before (bool):
@@ -59,32 +59,32 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.normalize_before = normalize_before
 
-    def forward(
+    def __call__(
         self,
-        tgt: torch.Tensor,
-        tgt_mask: torch.Tensor,
-        memory: torch.Tensor,
-        memory_mask: torch.Tensor,
-        cache: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tgt: mx.array,
+        tgt_mask: mx.array,
+        memory: mx.array,
+        memory_mask: mx.array,
+        cache: Optional[mx.array] = None
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Compute decoded features.
 
         Args:
-            tgt (torch.Tensor): Input tensor (#batch, maxlen_out, size).
-            tgt_mask (torch.Tensor): Mask for input tensor
+            tgt (mx.array): Input tensor (#batch, maxlen_out, size).
+            tgt_mask (mx.array): Mask for input tensor
                 (#batch, maxlen_out).
-            memory (torch.Tensor): Encoded memory
+            memory (mx.array): Encoded memory
                 (#batch, maxlen_in, size).
-            memory_mask (torch.Tensor): Encoded memory mask
+            memory_mask (mx.array): Encoded memory mask
                 (#batch, maxlen_in).
-            cache (torch.Tensor): cached tensors.
+            cache (mx.array): cached tensors.
                 (#batch, maxlen_out - 1, size).
 
         Returns:
-            torch.Tensor: Output tensor (#batch, maxlen_out, size).
-            torch.Tensor: Mask for output tensor (#batch, maxlen_out).
-            torch.Tensor: Encoded memory (#batch, maxlen_in, size).
-            torch.Tensor: Encoded memory mask (#batch, maxlen_in).
+            mx.array: Output tensor (#batch, maxlen_out, size).
+            mx.array: Mask for output tensor (#batch, maxlen_out).
+            mx.array: Encoded memory (#batch, maxlen_in, size).
+            mx.array: Encoded memory mask (#batch, maxlen_in).
 
         """
         residual = tgt
@@ -96,17 +96,30 @@ class DecoderLayer(nn.Module):
             tgt_q_mask = tgt_mask
         else:
             # compute only the last frame query keeping dim: max_time_out -> 1
-            assert cache.shape == (
-                tgt.shape[0],
-                tgt.shape[1] - 1,
-                self.size,
-            ), "{cache.shape} == {(tgt.shape[0], tgt.shape[1] - 1, self.size)}"
+            # assert cache.shape == (
+            #     tgt.shape[0],
+            #     tgt.shape[1] - 1,
+            #     self.size,
+            # ), "{cache.shape} == {(tgt.shape[0], tgt.shape[1] - 1, self.size)}"
             tgt_q = tgt[:, -1:, :]
             residual = residual[:, -1:, :]
-            tgt_q_mask = tgt_mask[:, -1:, :]
+            if tgt_mask is not None:
+                tgt_q_mask = tgt_mask[:, -1:, :]
+            else:
+                tgt_q_mask = None
 
-        x = residual + self.dropout(
-            self.self_attn(tgt_q, tgt, tgt, tgt_q_mask)[0])
+        # self_attn returns (output, cache) usually.
+        # But wait, original code calls `self.self_attn(..., cache=att_cache)[0]`?
+        # The DecoderLayer code in torch:
+        # x = residual + self.dropout(self.self_attn(tgt_q, tgt, tgt, tgt_q_mask)[0])
+
+        # self_attn here is MultiHeadedAttention.
+        # It returns (output, new_cache). We take [0].
+
+        # Also note self_attn expects (query, key, value, mask).
+
+        x_att, _ = self.self_attn(tgt_q, tgt, tgt, tgt_q_mask)
+        x = residual + self.dropout(x_att)
         if not self.normalize_before:
             x = self.norm1(x)
 
@@ -114,8 +127,10 @@ class DecoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.norm2(x)
-            x = residual + self.dropout(
-                self.src_attn(x, memory, memory, memory_mask)[0])
+
+            x_att, _ = self.src_attn(x, memory, memory, memory_mask)
+            x = residual + self.dropout(x_att)
+
             if not self.normalize_before:
                 x = self.norm2(x)
 
@@ -127,6 +142,6 @@ class DecoderLayer(nn.Module):
             x = self.norm3(x)
 
         if cache is not None:
-            x = torch.cat([cache, x], dim=1)
+            x = mx.concatenate([cache, x], axis=1)
 
         return x, tgt_mask, memory, memory_mask

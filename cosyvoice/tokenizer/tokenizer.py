@@ -2,7 +2,6 @@ import base64
 import os
 from functools import lru_cache
 from typing import Optional
-import torch
 from transformers import AutoTokenizer
 from whisper.tokenizer import Tokenizer
 
@@ -261,12 +260,11 @@ class CosyVoice2Tokenizer():
         self.skip_special_tokens = skip_special_tokens
 
     def encode(self, text, **kwargs):
-        tokens = self.tokenizer([text], return_tensors="pt")
-        tokens = tokens["input_ids"][0].cpu().tolist()
+        tokens = self.tokenizer([text], return_tensors=None)
+        tokens = tokens["input_ids"][0]
         return tokens
 
     def decode(self, tokens):
-        tokens = torch.tensor(tokens, dtype=torch.int64)
         text = self.tokenizer.batch_decode([tokens], skip_special_tokens=self.skip_special_tokens)[0]
         return text
 

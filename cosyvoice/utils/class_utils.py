@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import torch
+import mlx.nn as nn
 
 from cosyvoice.transformer.activation import Swish
 from cosyvoice.transformer.subsampling import (
@@ -35,16 +35,17 @@ from cosyvoice.transformer.subsampling import LegacyLinearNoSubsampling
 from cosyvoice.llm.llm import TransformerLM, Qwen2LM, CosyVoice3LM
 from cosyvoice.flow.flow import MaskedDiffWithXvec, CausalMaskedDiffWithXvec, CausalMaskedDiffWithDiT
 from cosyvoice.hifigan.generator import HiFTGenerator, CausalHiFTGenerator
-from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model, CosyVoice3Model
+# from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model, CosyVoice3Model
 
+import mlx.core as mx
 
 COSYVOICE_ACTIVATION_CLASSES = {
-    "hardtanh": torch.nn.Hardtanh,
-    "tanh": torch.nn.Tanh,
-    "relu": torch.nn.ReLU,
-    "selu": torch.nn.SELU,
-    "swish": getattr(torch.nn, "SiLU", Swish),
-    "gelu": torch.nn.GELU,
+    "hardtanh": lambda: lambda x: mx.minimum(mx.maximum(x, -1), 1),
+    "tanh": nn.Tanh,
+    "relu": nn.ReLU,
+    "selu": nn.SELU,
+    "swish": nn.SiLU, # SiLU is Swish
+    "gelu": nn.GELU,
 }
 
 COSYVOICE_SUBSAMPLE_CLASSES = {
@@ -55,7 +56,7 @@ COSYVOICE_SUBSAMPLE_CLASSES = {
     "conv2d": Conv2dSubsampling4,
     "conv2d6": Conv2dSubsampling6,
     "conv2d8": Conv2dSubsampling8,
-    'paraformer_dummy': torch.nn.Identity
+    'paraformer_dummy': nn.Identity
 }
 
 COSYVOICE_EMB_CLASSES = {
@@ -75,11 +76,8 @@ COSYVOICE_ATTENTION_CLASSES = {
 
 
 def get_model_type(configs):
-    # NOTE CosyVoice2Model inherits CosyVoiceModel
-    if isinstance(configs['llm'], TransformerLM) and isinstance(configs['flow'], MaskedDiffWithXvec) and isinstance(configs['hift'], HiFTGenerator):
-        return CosyVoiceModel
-    if isinstance(configs['llm'], Qwen2LM) and isinstance(configs['flow'], CausalMaskedDiffWithXvec) and isinstance(configs['hift'], HiFTGenerator):
-        return CosyVoice2Model
-    if isinstance(configs['llm'], CosyVoice3LM) and isinstance(configs['flow'], CausalMaskedDiffWithDiT) and isinstance(configs['hift'], CausalHiFTGenerator):
-        return CosyVoice3Model
-    raise TypeError('No valid model type found!')
+    # Placeholder as CosyVoiceModel classes are in cli/model.py which is not ported in this scope.
+    # If needed, import them.
+    # But user asked for llm, hifigan, transformer, tokenizer.
+    # So I will keep this commented out or raise error.
+    raise NotImplementedError("CosyVoiceModel classes not ported in this scope.")
